@@ -1,35 +1,35 @@
 """
 core/model.py
 -------------
-Loads the Tarteel Whisper model from HuggingFace and exposes a clean
-transcribe() interface that works on numpy arrays or file paths.
+Loads the Tarteel Whisper model and transcribes audio.
 
-The model: tarteel-ai/whisper-base-ar-quran
-  - Fine-tuned from openai/whisper-base
-  - Trained on Quranic Arabic recitation
-  - WER ~5.75 on evaluation set
+We bypass the HuggingFace pipeline() entirely and call the model directly.
+This is necessary because tarteel-ai/whisper-base-ar-quran was trained with
+transformers 4.26, but the pipeline() in newer transformers always injects a
+`language` kwarg into generate(), which triggers a ValueError when the saved
+generation_config lacks the `lang_to_id` field introduced in 4.27+.
+
+Calling model.generate() directly lets us control exactly what gets passed,
+avoiding the compatibility issue completely.
 """
 
 from __future__ import annotations
 
-import os
-import time
 import logging
+import time
 from pathlib import Path
 from typing import Union
 
 import numpy as np
 import torch
-from transformers import (
-    AutoProcessor,
-    AutoModelForSpeechSeq2Seq,
-    pipeline,
-)
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "tarteel-ai/whisper-base-ar-quran"
 SAMPLE_RATE = 16_000  # Whisper always expects 16 kHz
+CHUNK_LENGTH_S = 30   # max seconds per chunk (Whisper's context window)
+CHUNK_SAMPLES = CHUNK_LENGTH_S * SAMPLE_RATE
 
 
 class TarteelModel:
@@ -49,13 +49,6 @@ class TarteelModel:
         device: str | None = None,
         cache_dir: str | None = None,
     ) -> None:
-        """
-        Parameters
-        ----------
-        model_id  : HuggingFace model repo id.
-        device    : 'cuda', 'cpu', or None (auto-detect).
-        cache_dir : Where to cache the downloaded model weights.
-        """
         self.model_id = model_id
         self.device = device or self._auto_device()
         self.cache_dir = cache_dir
@@ -70,9 +63,9 @@ class TarteelModel:
     def transcribe(
         self,
         audio: Union[str, Path, np.ndarray],
-        language: str = "ar",
         return_timestamps: bool = False,
         chunk_length_s: int = 30,
+        **_kwargs,  # absorb legacy language= / task= kwargs gracefully
     ) -> dict:
         """
         Transcribe audio to Arabic text.
@@ -80,121 +73,147 @@ class TarteelModel:
         Parameters
         ----------
         audio            : File path (str/Path) OR numpy float32 array at 16kHz.
-        language         : ISO language code. Default 'ar' (Arabic).
-        return_timestamps: If True, returns word/chunk-level timestamps.
-        chunk_length_s   : For long audio, split into chunks of this size (seconds).
+        return_timestamps: If True, include chunk-level timestamps in result.
+        chunk_length_s   : Split long audio into chunks of this size (seconds).
 
         Returns
         -------
         dict with keys:
-          - "text"   : str  — full transcription (Arabic, no diacritics from Whisper)
-          - "chunks" : list — present only when return_timestamps=True
-          - "duration_s" : float — processing time
+          "text"       — full Arabic transcription
+          "chunks"     — list of {text, timestamp} dicts (if return_timestamps)
+          "duration_s" — wall-clock inference time
         """
         t0 = time.perf_counter()
 
-        # language + task are already set in generation_config during _load_model.
-        # Passing them again via generate_kwargs triggers the outdated-config
-        # ValueError on newer transformers versions, so we omit them here.
-        pipeline_kwargs: dict = {
-            "chunk_length_s": chunk_length_s,
-        }
-        if return_timestamps:
-            pipeline_kwargs["return_timestamps"] = "word"
-
-        # Accept numpy arrays directly
-        if isinstance(audio, np.ndarray):
-            inputs = {"array": audio, "sampling_rate": SAMPLE_RATE}
+        # ── Load audio array ───────────────────────────────────────────
+        if isinstance(audio, (str, Path)):
+            import librosa
+            audio_array, _ = librosa.load(str(audio), sr=SAMPLE_RATE, mono=True)
+            audio_array = audio_array.astype(np.float32)
         else:
-            inputs = str(audio)
+            audio_array = np.asarray(audio, dtype=np.float32)
 
-        raw = self._pipe(inputs, **pipeline_kwargs)
+        # ── Split into 30-second chunks (Whisper's context window) ─────
+        chunk_samples = int(chunk_length_s * SAMPLE_RATE)
+        chunks = [
+            audio_array[i : i + chunk_samples]
+            for i in range(0, len(audio_array), chunk_samples)
+        ]
+
+        texts = []
+        all_chunks = []
+
+        for idx, chunk in enumerate(chunks):
+            chunk_text, chunk_data = self._transcribe_chunk(
+                chunk, return_timestamps=return_timestamps
+            )
+            texts.append(chunk_text)
+            if return_timestamps:
+                all_chunks.extend(chunk_data)
 
         elapsed = time.perf_counter() - t0
+        full_text = " ".join(t.strip() for t in texts if t.strip())
 
-        result: dict = {
-            "text": raw["text"].strip(),
-            "duration_s": round(elapsed, 3),
-        }
-        if return_timestamps and "chunks" in raw:
-            result["chunks"] = raw["chunks"]
+        result: dict = {"text": full_text, "duration_s": round(elapsed, 3)}
+        if return_timestamps:
+            result["chunks"] = all_chunks
 
         logger.info(
-            f"[TarteelModel] Transcribed in {elapsed:.2f}s → '{result['text'][:60]}…'"
+            f"[TarteelModel] Transcribed {len(chunks)} chunk(s) in "
+            f"{elapsed:.2f}s → '{full_text[:60]}…'"
         )
         return result
 
-    def transcribe_segment(self, audio_array: np.ndarray, language: str = "ar") -> str:
+    def transcribe_segment(self, audio_array: np.ndarray, **_kwargs) -> str:
         """
         Lightweight call for short (<30s) audio segments.
-        Returns plain text string — used by the real-time streaming module.
+        Returns plain text — used by the real-time streaming module.
         """
-        result = self.transcribe(audio_array, language=language)
-        return result["text"]
+        return self.transcribe(audio_array)["text"]
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal: single-chunk transcription
+    # ------------------------------------------------------------------
+
+    def _transcribe_chunk(
+        self, chunk: np.ndarray, return_timestamps: bool = False
+    ) -> tuple[str, list]:
+        """
+        Run Whisper on a single ≤30s chunk using direct model.generate().
+        No pipeline(), no language kwarg — fully compatible with 4.26 weights.
+        """
+        # Feature extraction — produces log-mel spectrogram
+        inputs = self.processor(
+            chunk,
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="pt",
+        )
+        input_features = inputs.input_features.to(
+            self.device, dtype=self.torch_dtype
+        )
+
+        # Decode — we pass ONLY input_features and max_new_tokens.
+        # The forced_decoder_ids already encode <|ar|> + <|transcribe|> +
+        # <|notimestamps|> so we never need to pass language= to generate().
+        with torch.no_grad():
+            predicted_ids = self.model.generate(
+                input_features,
+                forced_decoder_ids=self.forced_decoder_ids,
+                max_new_tokens=448,
+            )
+
+        # Decode token ids → string
+        text = self.processor.batch_decode(
+            predicted_ids, skip_special_tokens=True
+        )[0].strip()
+
+        chunks_out = []
+        if return_timestamps:
+            chunks_out = [{"text": text, "timestamp": None}]
+
+        return text, chunks_out
+
+    # ------------------------------------------------------------------
+    # Internal: model loading
     # ------------------------------------------------------------------
 
     def _load_model(self) -> None:
         logger.info(f"[TarteelModel] Loading '{self.model_id}' …")
         t0 = time.perf_counter()
 
-        torch_dtype = torch.float16 if self.device == "cuda" else torch.float32
+        self.torch_dtype = torch.float16 if self.device == "cuda" else torch.float32
 
         self.processor = AutoProcessor.from_pretrained(
             self.model_id, cache_dir=self.cache_dir
         )
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
             self.model_id,
-            torch_dtype=torch_dtype,
+            torch_dtype=self.torch_dtype,
             low_cpu_mem_usage=True,
             cache_dir=self.cache_dir,
         )
         self.model.to(self.device)
+        self.model.eval()
 
-        # ── Fix: patch outdated generation config ──────────────────────
-        # tarteel-ai/whisper-base-ar-quran was trained with transformers
-        # 4.26 which predates the lang_to_id field. Newer transformers
-        # versions require it. We rebuild the config from the processor's
-        # tokenizer which always has the correct token mappings.
-        self.model.generation_config.update(
-            language="arabic",
-            task="transcribe",
-            forced_decoder_ids=None,          # let the model decide
-        )
-        if not hasattr(self.model.generation_config, "lang_to_id"):
-            # Build lang_to_id from the tokenizer
-            tok = self.processor.tokenizer
-            if hasattr(tok, "lang_to_id"):
-                self.model.generation_config.lang_to_id = tok.lang_to_id
-            elif hasattr(tok, "additional_special_tokens"):
-                # Derive it: tokens like <|arabic|> → {"arabic": token_id}
-                lang_to_id = {}
-                for token in tok.additional_special_tokens:
-                    if token.startswith("<|") and token.endswith("|>"):
-                        lang = token[2:-2]
-                        lang_to_id[lang] = tok.convert_tokens_to_ids(token)
-                self.model.generation_config.lang_to_id = lang_to_id
-
-        # Use the high-level pipeline for convenient chunked inference
-        self._pipe = pipeline(
-            task="automatic-speech-recognition",
-            model=self.model,
-            tokenizer=self.processor.tokenizer,
-            feature_extractor=self.processor.feature_extractor,
-            torch_dtype=torch_dtype,
-            device=self.device,
+        # Build forced_decoder_ids manually from the tokenizer.
+        # This is what the pipeline used to do internally — we do it once
+        # here so generate() never needs a `language` argument at all.
+        #
+        # Token sequence: <|startoftranscript|> <|ar|> <|transcribe|> <|notimestamps|>
+        # forced_decoder_ids = [(1, ar_token), (2, transcribe_token), (3, notimestamps_token)]
+        tok = self.processor.tokenizer
+        self.forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+            language="arabic", task="transcribe"
         )
 
         elapsed = time.perf_counter() - t0
         logger.info(f"[TarteelModel] Model loaded in {elapsed:.1f}s")
+        logger.info(f"[TarteelModel] forced_decoder_ids = {self.forced_decoder_ids}")
 
     @staticmethod
     def _auto_device() -> str:
         if torch.cuda.is_available():
             return "cuda"
-        # Apple Silicon
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
         return "cpu"
