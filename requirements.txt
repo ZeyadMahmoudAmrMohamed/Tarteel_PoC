@@ -1,0 +1,25 @@
+# === Core ASR ===
+transformers>=4.36.0
+torch>=2.0.0
+torchaudio>=2.0.0
+accelerate>=0.25.0
+
+# === Audio processing ===
+librosa>=0.10.0
+soundfile>=0.12.0
+numpy>=1.24.0
+
+# === Real-time audio (Phase 3) ===
+pyaudio>=0.2.13          # mic input
+webrtcvad>=2.0.10        # voice activity detection
+
+# === Arabic text processing & alignment ===
+python-Levenshtein>=0.23.0
+rapidfuzz>=3.5.0
+arabic-reshaper>=3.0.0   # for display purposes
+
+# === Utilities ===
+rich>=13.0.0             # beautiful CLI output
+python-dotenv>=1.0.0
+huggingface-hub>=0.20.0
+datasets>=2.14.0
