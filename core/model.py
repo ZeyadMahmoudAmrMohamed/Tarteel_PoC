@@ -93,12 +93,11 @@ class TarteelModel:
         """
         t0 = time.perf_counter()
 
-        # Build kwargs for the pipeline
-        generate_kwargs = {"language": language, "task": "transcribe"}
-
+        # language + task are already set in generation_config during _load_model.
+        # Passing them again via generate_kwargs triggers the outdated-config
+        # ValueError on newer transformers versions, so we omit them here.
         pipeline_kwargs: dict = {
             "chunk_length_s": chunk_length_s,
-            "generate_kwargs": generate_kwargs,
         }
         if return_timestamps:
             pipeline_kwargs["return_timestamps"] = "word"
@@ -153,6 +152,30 @@ class TarteelModel:
             cache_dir=self.cache_dir,
         )
         self.model.to(self.device)
+
+        # ── Fix: patch outdated generation config ──────────────────────
+        # tarteel-ai/whisper-base-ar-quran was trained with transformers
+        # 4.26 which predates the lang_to_id field. Newer transformers
+        # versions require it. We rebuild the config from the processor's
+        # tokenizer which always has the correct token mappings.
+        self.model.generation_config.update(
+            language="arabic",
+            task="transcribe",
+            forced_decoder_ids=None,          # let the model decide
+        )
+        if not hasattr(self.model.generation_config, "lang_to_id"):
+            # Build lang_to_id from the tokenizer
+            tok = self.processor.tokenizer
+            if hasattr(tok, "lang_to_id"):
+                self.model.generation_config.lang_to_id = tok.lang_to_id
+            elif hasattr(tok, "additional_special_tokens"):
+                # Derive it: tokens like <|arabic|> → {"arabic": token_id}
+                lang_to_id = {}
+                for token in tok.additional_special_tokens:
+                    if token.startswith("<|") and token.endswith("|>"):
+                        lang = token[2:-2]
+                        lang_to_id[lang] = tok.convert_tokens_to_ids(token)
+                self.model.generation_config.lang_to_id = lang_to_id
 
         # Use the high-level pipeline for convenient chunked inference
         self._pipe = pipeline(
