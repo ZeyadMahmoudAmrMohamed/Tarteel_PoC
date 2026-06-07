@@ -163,7 +163,7 @@ class TarteelModel:
             predicted_ids = self.model.generate(
                 input_features,
                 forced_decoder_ids=self.forced_decoder_ids,
-                max_new_tokens=448,
+                max_new_tokens=447,
             )
 
         # Decode token ids → string
