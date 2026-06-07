@@ -87,9 +87,13 @@ class TarteelModel:
 
         # ── Load audio array ───────────────────────────────────────────
         if isinstance(audio, (str, Path)):
-            import librosa
-            audio_array, _ = librosa.load(str(audio), sr=SAMPLE_RATE, mono=True)
-            audio_array = audio_array.astype(np.float32)
+            import torchaudio, torchaudio.transforms as T
+            waveform, sr = torchaudio.load(str(audio))
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            if sr != SAMPLE_RATE:
+                waveform = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)(waveform)
+            audio_array = waveform.squeeze(0).numpy().astype(np.float32)
         else:
             audio_array = np.asarray(audio, dtype=np.float32)
 
